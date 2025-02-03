@@ -4,6 +4,7 @@ import numpy as np
 import os
 from scipy.io import wavfile
 import librosa
+from PIL import Image, ImageDraw, ImageFont
 
 def detect_peaks(audio_path, threshold=0.5, min_distance=0.05):
     # Load audio file using librosa
@@ -27,7 +28,82 @@ def detect_peaks(audio_path, threshold=0.5, min_distance=0.05):
     onset_times = librosa.frames_to_time(onset_frames, sr=sr)
     return onset_times
 
-def create_karaoke_video(audio_path, syllables_file, output_path, words_per_page=10):
+def create_text_image(page_words, current_word_idx, width=1280, height=720, font_size=70):
+    # Create a black background
+    image = Image.new('RGB', (width, height), 'black')
+    draw = ImageDraw.Draw(image)
+    
+    # Load a font
+    try:
+        font = ImageFont.truetype("Arial.ttf", font_size)
+    except:
+        font = ImageFont.load_default()
+    
+    # Split words into lines based on newline markers
+    lines = []
+    current_line = []
+    word_idx_in_line = 0
+    target_line = 0
+    target_word_pos = 0
+    
+    for i, word in enumerate(page_words):
+        if word == "\n":
+            if current_line:
+                lines.append(current_line)
+                current_line = []
+                word_idx_in_line = 0
+            continue
+            
+        current_line.append(word)
+        if i == current_word_idx:
+            target_line = len(lines)
+            target_word_pos = word_idx_in_line
+        word_idx_in_line += 1
+    
+    if current_line:
+        lines.append(current_line)
+    
+    # Calculate total height of text block
+    line_height = font_size * 1.5
+    total_height = len(lines) * line_height
+    
+    # Calculate starting y position to center text block
+    y = (height - total_height) // 2
+    
+    # Draw each line
+    for i, line in enumerate(lines):
+        line_text = ' '.join(line)
+        bbox = draw.textbbox((0, 0), line_text, font=font)
+        line_width = bbox[2] - bbox[0]
+        x = (width - line_width) // 2
+        
+        # Draw white text
+        draw.text((x, y + i * line_height), line_text, fill='white', font=font)
+        
+        # Draw yellow highlighted word if it's on this line
+        if i == target_line and current_word_idx < len(page_words):
+            before_text = ' '.join(line[:target_word_pos])
+            if before_text:
+                bbox_before = draw.textbbox((0, 0), before_text + ' ', font=font)
+                x_yellow = x + bbox_before[2] - bbox_before[0]
+            else:
+                x_yellow = x
+            
+            current_word = line[target_word_pos]
+            draw.text((x_yellow, y + i * line_height), current_word, fill='yellow', font=font)
+    
+    return np.array(image)
+
+def create_karaoke_video(audio_path, syllables_file, output_path, max_words_per_page=15):
+    """
+    Create a karaoke video with highlighted lyrics.
+    
+    Args:
+        audio_path: Path to the audio file
+        syllables_file: Path to the file containing syllables
+        output_path: Path where the output video will be saved
+        max_words_per_page: Maximum number of words per page before forcing a break (default: 15)
+    """
     # Load the audio file
     audio = AudioSegment.from_file(audio_path)
     
@@ -55,28 +131,44 @@ def create_karaoke_video(audio_path, syllables_file, output_path, words_per_page
     # Group syllables into words and pages
     pages = []
     current_page = []
-    word_count = 0
     current_word = []
     word_timings = []  # Store start time for each word
     
+    # Define punctuation that indicates breaks
+    break_punctuation = [',', '.', '!', ')', '?']
+    
     for i, syllable in enumerate(syllables):
+        # Check if this syllable starts a new line (capital letter or open parenthesis)
+        starts_new_line = (syllable.strip() and 
+                          (syllable.strip()[0].isupper() or 
+                           syllable.strip().startswith('(')))
+        
+        if starts_new_line and current_page and current_word == []:
+            # Add newline marker to current page
+            current_page.append("\n")
+        
         if syllable.endswith('-'):  # Part of a word
             current_word.append(syllable.rstrip('-'))
         else:  # End of word
             current_word.append(syllable)
-            word_timings.append(onset_times[i])  # Store the timing of the last syllable in word
-            word_count += 1
+            word_timings.append(onset_times[i])
             
             # Join syllables into a complete word
             complete_word = ''.join(current_word)
+            current_page.append(complete_word)
             
-            if word_count >= words_per_page:
-                current_page.append(complete_word)
+            # Check if this word ends with break punctuation
+            should_break = any(complete_word.endswith(p) for p in break_punctuation)
+            
+            if should_break:
+                if len(current_page) > 0:
+                    pages.append(current_page)
+                    current_page = []
+            # Fallback to prevent pages from getting too long
+            elif len(current_page) >= max_words_per_page:
                 pages.append(current_page)
                 current_page = []
-                word_count = 0
-            else:
-                current_page.append(complete_word)
+                
             current_word = []
     
     if current_page:  # Add any remaining words
@@ -90,25 +182,22 @@ def create_karaoke_video(audio_path, syllables_file, output_path, words_per_page
     for page in pages:
         page_words = page
         
+        # Count actual words (excluding newline markers) in this page
+        actual_words = [w for w in page_words if w != "\n"]
+        
         # Calculate how long this page should be displayed
         page_start_time = word_timings[word_idx]
-        page_end_time = word_timings[min(word_idx + len(page_words) - 1, len(word_timings) - 1)]
+        page_end_time = word_timings[min(word_idx + len(actual_words) - 1, len(word_timings) - 1)]
         
-        # Create background clip (all words in white)
-        bg_txt_clip = mpy.TextClip(
-            txt=' '.join(page_words),
-            fontsize=70,
-            color='white',
-            bg_color='black',
-            size=(1280, 720),
-            method='caption',
-            align='center'
-        ).set_duration(page_end_time - page_start_time)
+        # Create clips for each word change
+        page_clips = []
+        word_count = 0
         
-        # Create individual clips for each word in yellow
-        word_clips = []
         for i, word in enumerate(page_words):
-            current_word_idx = word_idx + i
+            if word == "\n":
+                continue
+                
+            current_word_idx = word_idx + word_count
             if current_word_idx >= len(word_timings):
                 break
                 
@@ -119,33 +208,22 @@ def create_karaoke_video(audio_path, syllables_file, output_path, words_per_page
             else:
                 word_end = page_end_time - page_start_time
             
-            # Create a clip for this word
-            spaces_before = ' ' * len(' '.join(page_words[:i]))
-            if i > 0:
-                spaces_before += ' '
-            spaces_after = ' ' * len(' '.join(page_words[i+1:]))
+            # Create frame with current word highlighted
+            frame = create_text_image(page_words, i)
             
-            word_txt_clip = mpy.TextClip(
-                txt=spaces_before + word + spaces_after,
-                fontsize=70,
-                color='yellow',
-                bg_color='rgba(0,0,0,0)',
-                size=(1280, 720),
-                method='caption',
-                transparent=True,
-                align='center'
-            ).set_duration(word_end - word_start)
+            # Create clip from frame
+            txt_clip = mpy.ImageClip(frame).set_duration(word_end - word_start)
+            txt_clip = txt_clip.set_start(word_start)
+            page_clips.append(txt_clip)
             
-            word_txt_clip = word_txt_clip.set_start(word_start)
-            word_clips.append(word_txt_clip)
+            word_count += 1
         
         # Composite all clips for this page
-        page_clips = [bg_txt_clip] + word_clips
         comp_clip = mpy.CompositeVideoClip(page_clips)
         comp_clip = comp_clip.set_start(page_start_time)
         clips.append(comp_clip)
         
-        word_idx += len(page_words)
+        word_idx += len(actual_words)
 
     # Combine all clips
     final_video = mpy.CompositeVideoClip(clips)
@@ -166,4 +244,8 @@ if __name__ == "__main__":
     syllables_file = "./lyrics/bon_voyage_no_cure_syllables.txt"
     output_path = "./videos/bon_voyage_video.mp4"
     
-    create_karaoke_video(audio_path, syllables_file, output_path)
+    create_karaoke_video(
+        audio_path,
+        syllables_file,
+        output_path
+    )
